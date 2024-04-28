@@ -1,0 +1,16 @@
+faiss-cpu
+google-cloud-aiplatform
+google-cloud-logging
+langchain
+langchain-community
+langchain_google_vertexai
+pillow-heif
+unstructured-inference
+pypdf
+pdf2image
+unstructured_pytesseract
+pikepdf
+pdfminer.six
+streamlit
+unstructured
+vertexai
