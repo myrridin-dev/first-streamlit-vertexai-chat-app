@@ -18,6 +18,7 @@ from langchain_community.chat_message_histories import StreamlitChatMessageHisto
 from langchain_community.document_loaders import TextLoader, UnstructuredPDFLoader
 from langchain_community.vectorstores import FAISS
 
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
@@ -39,10 +40,27 @@ ROLE_AI="ai"
 ROLE_HUMAN="human"
 ROLE_SYSTEM="system"
 
+CHAT_HISTORY_KEY="chat_history"
+
 DEBUG = True
 
-st.set_page_config(page_title="Tax guide for seniors", page_icon="🦈")
-st.title("📖 Tax guide for seniors")
+# chat histories can be stored by session_id
+def get_session_id():
+    # TODO change to something that is unique to the calling user
+    return "any"
+
+def get_chat_history_by_session_id(session_id) -> BaseChatMessageHistory:
+    # TODO RedisChatMessageHistory to persist/retrieve history by session_id, conversation_id
+    # Eg. session_manager = RedisChatMessageHistory(str(session_id), redis_url, key_prefix="chat_history", ttl=3600)
+    # return session_manager.get_session_history
+    return msgs
+
+# Clear Chat
+def clear_chat_history():
+    msgs.messages.clear()
+
+st.set_page_config(page_title="Medicare in 2024", page_icon="🦈")
+st.title("📖 Medicare in 2024")
 
 def get_split_documents(index_path: str) -> List[str]:
     chunk_size=1024
@@ -69,7 +87,12 @@ def create_vector_db():
     # Load documents, generate vectors and store in Vector database
     split_docs = get_split_documents(INDEX_PATH)
     faissdb = FAISS.from_documents(split_docs, embeddings)
-    faissdb.save_local(DB_PATH + '/faiss.db')
+    faissdb_name = DB_PATH + '/faiss.db'
+    faissdb.save_local(faissdb_name)
+
+    if DEBUG:
+        faissdb_size = os.path.getsize(faissdb_name)
+        print(f"Size of FAISS db on disk: {faissdb_size} bytes")
 
     return faissdb
 
@@ -90,35 +113,6 @@ def get_embeddings() -> VertexAIEmbeddings:
         model_name='textembedding-gecko',
         batch_size=5
     )
-
-def get_system_prompt_template():
-    return """
-        You are a helpful AI assistant. You're tasked to answer the question given below, but only based on the context provided.
-
-        The Tax Guide for Seniors provides a general overview of selected topics that are of interest to older tax-payers...
-
-        Q: How do I report the amounts I set aside for my IRA?
-        A: See Individual Retirement Arrangement Contributions and Deductions in chapter 3.
-
-        Q: What are some of the credits I can claim to reduce my tax?
-        A: See chapter 5 for discussions on the credit for the elderly or the disabled, the child and dependent care credit, and the earned income credit.
-
-        Q: Must I report the sale of my home? If I had a gain, is any part of it taxable?
-        A: See Sale of Home in chapter 2.
-
-        context:
-        <context>
-        {context}
-        </context>
-
-        question:
-        <question>
-        {input}
-        </question>
-
-        If you cannot find an answer ask the user to rephrase the question.
-        answer:
-    """
 
 # main
 globals.set_debug(DEBUG)
@@ -147,20 +141,44 @@ contextualize_q_system_prompt = """
 contextualize_q_prompt = ChatPromptTemplate.from_messages(
     [
         (ROLE_SYSTEM, contextualize_q_system_prompt),
-        MessagesPlaceholder("history"),
+        MessagesPlaceholder(CHAT_HISTORY_KEY),
         (ROLE_HUMAN, "{input}"),
     ]
 )
+
+# See https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain/chains/history_aware_retriever.py#L57
+# If there is no chat_history in invoke(), chain is input | retriever | llm
+# If there is chat_history in invoke(), chain is:
+#   input + chat_history | llm using contextualize_q_system_prompt to get updated_input
+#   updated_input | retriever | llm
 history_aware_retriever = create_history_aware_retriever(
     llm, retriever, contextualize_q_prompt
 )
 
 ### Main chain for chat with history
-system_prompt = get_system_prompt_template()
+qa_system_prompt = """
+    You are a helpful AI assistant and an expert at Medicare laws in the US. You're tasked to answer the question given below, \
+    but only based on the context provided. If you cannot find an answer ask the user to rephrase the question. Use three sentences \
+    maximum and keep the answer concise.
+
+    Examples:
+    Q: Will I get Part A and Part B automatically?
+    A: If you’re already getting benefits from Social Security or the Railroad Retirement Board (RRB), you’ll automatically get \
+    Part A and Part B starting the first day of the month you turn 65. 
+
+    Q: Will I have to sign up for Part A and/or Part B?
+    A: If you’re close to 65, but NOT getting Social Security or RRB benefits, you’ll need to sign up for Medicare.
+
+    Q: Do I have to pay for Part A?
+    A: You usually don’t pay a monthly premium for Part A coverage if you or your spouse paid Medicare taxes while working \
+    for a certain amount of time. 
+
+    {context}
+"""
 qa_prompt = ChatPromptTemplate.from_messages(
     [
-        (ROLE_SYSTEM, system_prompt),
-        MessagesPlaceholder(variable_name="history"),
+        (ROLE_SYSTEM, qa_system_prompt),
+        MessagesPlaceholder(CHAT_HISTORY_KEY),
         (ROLE_HUMAN, "{input}"),
     ]
 )
@@ -175,15 +193,11 @@ if len(msgs.messages) == 0:
 
 rag_chain_with_history = RunnableWithMessageHistory(
     rag_chain,
-    lambda session_id: msgs,
+    get_chat_history_by_session_id, # This is a function that returns history given a session_id
     input_messages_key="input",
     output_messages_key="answer",   # This is what the response key in the vertexai response is
-    history_messages_key="history", # This is specifying the key where Langchain automatically stores new messages as history?
+    history_messages_key=CHAT_HISTORY_KEY, # This is specifying the key where Langchain automatically stores new messages as history?
 )
-
-# Clear Chat
-def clear_chat_history():
-    msgs.messages.clear()
 
 view_messages = st.expander("View the message contents in session state")
 
@@ -196,10 +210,13 @@ for msg in msgs.messages:
     st.chat_message(msg.type).write(msg.content)
 
 if question := st.chat_input():
+    session_id = get_session_id()
+    chat_history = get_chat_history_by_session_id(session_id)
+
     st.chat_message(ROLE_HUMAN).write(question)
 
-    # This ensures new messages are saved to history automatically by Langchain during chain run
-    config = {"configurable": {"session_id": "any"}}
+    # we specify the corresponding chat history via a configuration parameter tied to session_id
+    config = {"configurable": {"session_id": session_id}}
 
     # Chain - Stream vs. Full
     if streaming_on:
